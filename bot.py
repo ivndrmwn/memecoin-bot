@@ -31,7 +31,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAINALYSIS_API_KEY = os.environ["CHAINALYSIS_API_KEY"]
 WORKFLOW_SLUG = "memecoin-scanner"
-WORKFLOWS_BASE_URL = "https://api.chainalysis.com/workflows"
+WORKFLOWS_BASE_URL = "https://api.workflows-eu.chainalysis.com"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
