@@ -1,6 +1,6 @@
+# -*- coding: utf-8 -*-
 """
 Memecoin Intelligence Telegram Bot
-Calls Data Solutions API directly.
 """
 
 import os
@@ -46,12 +46,11 @@ def ds_query(sql):
 
 
 def get_kb_lookup():
-    """Build a lookup with tag, category, and label for each KB address."""
     addrs = {}
     for addr, data in KB.get("deployers", {}).items():
         addrs[addr] = {"tag": "DEV", "label": data.get("label", "?"), "risk": data.get("risk", "?")}
     for addr, data in KB.get("dev_adjacent", {}).items():
-        addrs[addr] = {"tag": data.get("tag", "DEV_ADJACENT"), "label": data.get("label", "?")}
+        addrs[addr] = {"tag": data.get("tag", "DEV_ADJ"), "label": data.get("label", "?")}
     for addr, data in KB.get("insider_wallets", {}).items():
         addrs[addr] = {"tag": "INSIDER", "label": data.get("label", "?"), "profit": data.get("profit_usd", 0)}
     for addr, data in KB.get("smart_wallets", {}).items():
@@ -62,13 +61,11 @@ def get_kb_lookup():
 def scan_token(contract, chain):
     ca = contract.lower()
     ca_frag = ca[2:] if ca.startswith("0x") else ca
-    kb_lookup = get_kb_lookup()
-
-    report = {
-        "contract": ca, "chain": chain, "risk_score": "unknown",
-        "dev_signals": [], "insider_signals": [], "smart_signals": [], "distribution_signals": [],
-        "holders": [], "distribution": {},
-    }
+    kb = get_kb_lookup()
+    report = {"contract": ca, "chain": chain, "risk_score": "unknown",
+              "dev_signals": [], "insider_signals": [], "smart_signals": [],
+              "distribution_signals": [], "deployer_info": [], "distribution_detail": [],
+              "holders": []}
 
     # Find token
     try:
@@ -92,19 +89,28 @@ def scan_token(contract, chain):
     deployers = []
     total_supply = 0
     try:
-        r = ds_query(f"SELECT receiver_address, SUM(amount_asset) as minted, COUNT(*) as mints FROM {chain}.transfers_clustered WHERE asset_id = '{asset_id}' AND sender_address = '0x0000000000000000000000000000000000000000' GROUP BY receiver_address ORDER BY minted DESC LIMIT 3")
+        r = ds_query(f"SELECT receiver_address, SUM(amount_asset) as minted, COUNT(*) as mints, MIN(transaction_timestamp) as first_mint FROM {chain}.transfers_clustered WHERE asset_id = '{asset_id}' AND sender_address = '0x0000000000000000000000000000000000000000' GROUP BY receiver_address ORDER BY minted DESC LIMIT 3")
         for row in r["results"]:
             m = row["minted"] or 0
             total_supply += m
-            d = {"address": row["receiver_address"], "minted": m}
-            if row["receiver_address"] in kb_lookup:
-                kb = kb_lookup[row["receiver_address"]]
-                d["kb"] = kb
-                report["dev_signals"].append(f"{kb['label']} [risk: {kb.get('risk','?')}]")
+            d = {"address": row["receiver_address"], "minted": m, "first_mint": str(row["first_mint"])[:10]}
+            if row["receiver_address"] in kb:
+                k = kb[row["receiver_address"]]
+                d["kb_tag"] = k["tag"]
+                d["kb_label"] = k["label"]
+                report["dev_signals"].append(f"Known deployer: {k['label']} [risk: {k.get('risk','?')}]")
             deployers.append(d)
         report["total_supply"] = total_supply
     except:
         pass
+
+    for d in deployers:
+        pct = d["minted"] / total_supply * 100 if total_supply > 0 else 0
+        addr_short = d["address"][:12] + "..." + d["address"][-4:]
+        tag_str = ""
+        if "kb_tag" in d:
+            tag_str = f" [{d['kb_tag']}: {d['kb_label']}]"
+        report["deployer_info"].append(f"{addr_short} minted {pct:.0f}% on {d['first_mint']}{tag_str}")
 
     # Distribution
     if deployers:
@@ -119,52 +125,73 @@ def scan_token(contract, chain):
                 pct = total / supply * 100
                 rname = row["receiver_name"] or ""
                 rcat = row["receiver_category"] or ""
+                addr_short = row["receiver_address"][:12] + "..." + row["receiver_address"][-4:]
                 if "burn" in rname.lower() or row["receiver_address"].startswith("0x00000000000000000000000000000000000"):
                     burn += pct
+                    report["distribution_detail"].append(f"Burned: {pct:.1f}%")
                 elif "exchange" in rcat.lower():
                     exchange += pct
-                elif any(x in rname.lower() for x in ["uniswap", "pancakeswap", "sushiswap", "aerodrome"]):
+                    report["distribution_detail"].append(f"{rname or addr_short} [exchange]: {pct:.1f}%")
+                elif any(x in rname.lower() for x in ["uniswap", "pancakeswap", "sushiswap", "aerodrome", "raydium"]):
                     pool += pct
-                elif row["receiver_address"] != d_addr:
-                    free += 1
-                if row["receiver_address"] in kb_lookup:
-                    kb = kb_lookup[row["receiver_address"]]
-                    tag = kb["tag"]
-                    if tag in ("DEV", "DEV_DISTRIBUTOR", "DEV_HOLDER", "DEV_HOP", "DEV_HELPER", "DEV_GAS_FUNDER"):
-                        report["dev_signals"].append(f"Sent {pct:.1f}% to {kb['label']}")
-                    elif tag == "INSIDER":
-                        report["insider_signals"].append(f"Sent {pct:.1f}% to {kb['label']}")
-                    elif tag == "SMART_MONEY":
-                        report["smart_signals"].append(f"Sent {pct:.1f}% to {kb['label']}")
-            report["distribution"] = {"burn": round(burn, 1), "pool": round(pool, 1), "exchange": round(exchange, 1), "free_recipients": free}
+                    report["distribution_detail"].append(f"{rname or addr_short} [DEX]: {pct:.1f}%")
+                else:
+                    if rname:
+                        report["distribution_detail"].append(f"{rname} [{rcat or '?'}]: {pct:.1f}%")
+                    else:
+                        report["distribution_detail"].append(f"{addr_short}: {pct:.1f}%")
+                    if row["receiver_address"] != d_addr:
+                        free += 1
+                if row["receiver_address"] in kb:
+                    k = kb[row["receiver_address"]]
+                    if k["tag"] in ("DEV", "DEV_DISTRIBUTOR", "DEV_HOLDER", "DEV_HOP", "DEV_HELPER", "DEV_GAS_FUNDER"):
+                        report["dev_signals"].append(f"Sent {pct:.1f}% to {k['label']}")
+                    elif k["tag"] == "INSIDER":
+                        report["insider_signals"].append(f"Sent {pct:.1f}% to {k['label']}")
+                    elif k["tag"] == "SMART_MONEY":
+                        report["smart_signals"].append(f"Sent {pct:.1f}% to {k['label']}")
+            report["distribution"] = {"burn": round(burn, 1), "pool": round(pool, 1), "exchange": round(exchange, 1), "free": free}
             if free > 3 and pool < 10:
-                report["distribution_signals"].append(f"{free} wallets received free tokens, only {pool:.0f}% went to DEX pools")
+                report["distribution_signals"].append(f"{free} wallets received free tokens, only {pool:.0f}% to DEX")
         except:
             pass
 
     # Top holders
     try:
-        r = ds_query(f"""SELECT address, balance FROM (
+        r = ds_query(f"""SELECT address, balance, name, category FROM (
             SELECT address, SUM(received) - SUM(sent) as balance FROM (
                 SELECT receiver_address as address, SUM(amount_asset) as received, 0 as sent FROM {chain}.transfers_clustered WHERE asset_id = '{asset_id}' AND receiver_address != '0x0000000000000000000000000000000000000000' GROUP BY receiver_address
                 UNION ALL
                 SELECT sender_address as address, 0 as received, SUM(amount_asset) as sent FROM {chain}.transfers_clustered WHERE asset_id = '{asset_id}' AND sender_address != '0x0000000000000000000000000000000000000000' GROUP BY sender_address
-            ) t GROUP BY address) t2 WHERE balance > 0 ORDER BY balance DESC LIMIT 10""")
+            ) t GROUP BY address) t2
+            LEFT JOIN (
+                SELECT receiver_address as address, receiver_name as name, receiver_category as category
+                FROM {chain}.transfers_clustered
+                WHERE asset_id = '{asset_id}' AND receiver_name IS NOT NULL
+                GROUP BY receiver_address, receiver_name, receiver_category
+            ) n USING (address)
+            WHERE balance > 0 ORDER BY balance DESC LIMIT 10""")
         supply = total_supply or 1
         for row in r["results"]:
             bal = row["balance"] or 0
             pct = bal / supply * 100
-            h = {"address": row["address"], "pct": round(pct, 1)}
-            if row["address"] in kb_lookup:
-                kb = kb_lookup[row["address"]]
-                h["tag"] = kb["tag"]
-                h["label"] = kb["label"]
-                if kb["tag"] in ("DEV", "DEV_DISTRIBUTOR", "DEV_HOLDER", "DEV_HOP", "DEV_HELPER", "DEV_GAS_FUNDER"):
-                    report["dev_signals"].append(f"{kb['label']} holds {pct:.1f}%")
-                elif kb["tag"] == "INSIDER":
-                    report["insider_signals"].append(f"{kb['label']} holds {pct:.1f}%")
-                elif kb["tag"] == "SMART_MONEY":
-                    report["smart_signals"].append(f"{kb['label']} holds {pct:.1f}%")
+            name = row.get("name") or ""
+            cat = row.get("category") or ""
+            addr_short = row["address"][:12] + "..." + row["address"][-4:]
+            h = {"address": row["address"], "addr_short": addr_short, "pct": round(pct, 1), "name": name, "category": cat}
+            # Flag >100% as pool/contract
+            if pct > 100:
+                h["is_pool"] = True
+            if row["address"] in kb:
+                k = kb[row["address"]]
+                h["kb_tag"] = k["tag"]
+                h["kb_label"] = k["label"]
+                if k["tag"] in ("DEV", "DEV_DISTRIBUTOR", "DEV_HOLDER", "DEV_HOP"):
+                    report["dev_signals"].append(f"{k['label']} holds {pct:.1f}%")
+                elif k["tag"] == "INSIDER":
+                    report["insider_signals"].append(f"{k['label']} holds {pct:.1f}%")
+                elif k["tag"] == "SMART_MONEY":
+                    report["smart_signals"].append(f"{k['label']} holds {pct:.1f}%")
             report["holders"].append(h)
     except:
         pass
@@ -174,7 +201,6 @@ def scan_token(contract, chain):
     has_insider = len(report["insider_signals"]) > 0
     has_smart = len(report["smart_signals"]) > 0
     has_dist = len(report["distribution_signals"]) > 0
-
     if has_insider and has_dev:
         report["risk_score"] = "critical"
     elif has_dist and has_dev:
@@ -188,7 +214,7 @@ def scan_token(contract, chain):
     else:
         report["risk_score"] = "clean"
 
-    report["kb_size"] = len(kb_lookup)
+    report["kb_size"] = len(kb)
     return report
 
 
@@ -196,99 +222,114 @@ def format_report(r):
     if "error" in r:
         return f"Error: {r['error']}"
 
-    emoji = {"critical": "\U0001f534", "high": "\U0001f7e0", "medium": "\U0001f7e1", "low_with_smart_money": "\U0001f7e2", "clean": "\u26aa"}.get(r.get("risk_score", ""), "\u26ab")
+    risk = r.get("risk_score", "unknown")
+    risk_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low_with_smart_money": "🟢", "clean": "⚪"}
+    icon = risk_icons.get(risk, "⚫")
 
     lines = []
-    lines.append(f"{emoji} {r.get('symbol','?')} on {r.get('chain','?')}")
-    lines.append(f"Risk: {r.get('risk_score','?').upper()}")
-    lines.append("")
+    lines.append(f"{icon} {r.get('symbol','?')} on {r.get('chain','?')}")
+    lines.append(f"Risk: {risk.upper()}")
 
     # Stats
     stats = r.get("stats", {})
     if stats:
-        lines.append(f"\U0001f4ca Stats")
+        lines.append("")
+        lines.append("📊 STATS")
         lines.append(f"  Transfers: {stats.get('transfers',0):,}")
         lines.append(f"  Volume: ${stats.get('volume_usd',0):,.0f}")
-        lines.append(f"  Active: {stats.get('first','')} to {stats.get('last','')}")
+        lines.append(f"  Active: {stats.get('first','')} → {stats.get('last','')}")
+
+    # Deployer
+    deployer_info = r.get("deployer_info", [])
+    if deployer_info:
         lines.append("")
+        lines.append("🔨 DEPLOYER")
+        for d in deployer_info:
+            lines.append(f"  {d}")
 
     # Distribution
-    dist = r.get("distribution", {})
-    if dist:
-        lines.append(f"\U0001f4b0 Supply Distribution")
-        lines.append(f"  Burned: {dist.get('burn',0)}%")
-        lines.append(f"  DEX pool: {dist.get('pool',0)}%")
-        lines.append(f"  Exchange: {dist.get('exchange',0)}%")
-        if dist.get("free_recipients", 0) > 0:
-            lines.append(f"  Free recipients: {dist['free_recipients']}")
+    dist_detail = r.get("distribution_detail", [])
+    if dist_detail:
         lines.append("")
+        lines.append("💰 DISTRIBUTION")
+        for d in dist_detail[:8]:
+            lines.append(f"  {d}")
 
-    # Distribution warnings
+    # Distribution warning
     dist_signals = r.get("distribution_signals", [])
     if dist_signals:
-        lines.append(f"\u26a0\ufe0f Distribution Warning")
+        lines.append("")
+        lines.append("⚠️ WARNING")
         for s in dist_signals:
             lines.append(f"  {s}")
-        lines.append("")
 
-    # Dev signals
+    # Dev
     dev = r.get("dev_signals", [])
     if dev:
-        lines.append(f"\U0001f6a8 Dev / Deployer Matches")
+        lines.append("")
+        lines.append("🚨 KNOWN DEV / DEPLOYER")
         seen = set()
         for s in dev:
             if s not in seen:
-                lines.append(f"  - {s}")
+                lines.append(f"  • {s}")
                 seen.add(s)
-        lines.append("")
 
-    # Insider signals
+    # Insider
     insider = r.get("insider_signals", [])
     if insider:
-        lines.append(f"\U0001f6a9 Insider Matches")
+        lines.append("")
+        lines.append("🚩 KNOWN INSIDER")
         seen = set()
         for s in insider:
             if s not in seen:
-                lines.append(f"  - {s}")
+                lines.append(f"  • {s}")
                 seen.add(s)
-        lines.append("")
 
-    # Smart money signals
+    # Smart money
     smart = r.get("smart_signals", [])
     if smart:
-        lines.append(f"\U0001f9e0 Smart Money Detected")
+        lines.append("")
+        lines.append("🧠 SMART MONEY")
         seen = set()
         for s in smart:
             if s not in seen:
-                lines.append(f"  - {s}")
+                lines.append(f"  • {s}")
                 seen.add(s)
-        lines.append("")
 
     # Top holders
     holders = r.get("holders", [])
     if holders:
-        lines.append(f"\U0001f451 Top Holders")
-        for h in holders[:7]:
-            addr = h["address"][:12] + "..." + h["address"][-4:]
-            pct = h.get("pct", 0)
-            tag = h.get("tag", "")
-            label = h.get("label", "")
-            if tag in ("DEV", "DEV_DISTRIBUTOR", "DEV_HOLDER", "DEV_HOP"):
-                marker = f" \U0001f6a8 DEV: {label}"
-            elif tag == "INSIDER":
-                marker = f" \U0001f6a9 INSIDER: {label}"
-            elif tag == "SMART_MONEY":
-                marker = f" \U0001f9e0 {label}"
-            else:
-                marker = ""
-            lines.append(f"  {addr} {pct}%{marker}")
         lines.append("")
+        lines.append("👑 TOP HOLDERS")
+        for h in holders[:7]:
+            pct = h.get("pct", 0)
+            name = h.get("name", "")
+            cat = h.get("category", "")
+            addr = h.get("addr_short", "")
+
+            if h.get("is_pool"):
+                label = f"🔄 DEX Pool/Router ({addr})"
+            elif h.get("kb_tag") in ("DEV", "DEV_DISTRIBUTOR", "DEV_HOLDER", "DEV_HOP"):
+                label = f"🚨 {h.get('kb_label', 'DEV')}"
+            elif h.get("kb_tag") == "INSIDER":
+                label = f"🚩 {h.get('kb_label', 'INSIDER')}"
+            elif h.get("kb_tag") == "SMART_MONEY":
+                label = f"🧠 {h.get('kb_label', 'SMART')}"
+            elif name:
+                label = f"{name}" + (f" [{cat}]" if cat else "")
+            else:
+                label = addr
+
+            lines.append(f"  {pct}% — {label}")
 
     # Footer
-    total_hits = len(dev) + len(insider) + len(smart)
-    lines.append(f"KB: {r.get('kb_size',0)} tracked wallets | {total_hits} matches")
-    if not dev and not insider and not smart and not dist_signals:
-        lines.append("No known devs, insiders, or smart money found.")
+    total_hits = len(set(dev)) + len(set(insider)) + len(set(smart))
+    lines.append("")
+    lines.append(f"📋 Scanned against {r.get('kb_size',0)} tracked wallets")
+    if total_hits > 0:
+        lines.append(f"🔍 {total_hits} matches found in knowledge base")
+    else:
+        lines.append("✅ No known devs, insiders, or smart money detected")
 
     return "\n".join(lines)
 
@@ -302,16 +343,13 @@ async def scan_command(update, context):
             "Example:\n/scan 0xfb5B838b6cfEEdC2873aB27866079AC55363D37E bsc"
         )
         return
-
     contract = args[0]
     chain_input = args[1] if len(args) > 1 else "ethereum"
     chain = CHAINS.get(chain_input.lower(), chain_input.lower())
-
     if not contract.startswith("0x") or len(contract) != 42:
         await update.message.reply_text("Invalid address. Must be 0x + 40 hex chars.")
         return
-
-    msg = await update.message.reply_text(f"Scanning {contract[:10]}...{contract[-6:]} on {chain}...")
+    msg = await update.message.reply_text(f"⏳ Scanning {contract[:10]}...{contract[-6:]} on {chain}...")
     try:
         result = scan_token(contract, chain)
         await msg.edit_text(format_report(result))
@@ -322,7 +360,7 @@ async def scan_command(update, context):
 
 async def start_command(update, context):
     await update.message.reply_text(
-        "Memecoin Intelligence Scanner\n\n"
+        "🔬 Memecoin Intelligence Scanner\n\n"
         "Usage: /scan <contract> <chain>\n\n"
         "Chains: eth, base, bsc, arb, poly, op, avax\n\n"
         "Example:\n/scan 0xfb5B838b6cfEEdC2873aB27866079AC55363D37E bsc"
