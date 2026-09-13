@@ -589,27 +589,170 @@ async def reload_command(update, context):
     await update.message.reply_text(f"🔄 KB reloaded: {total} wallets, {len(KB.get('holder_tracker', {}))} tracked, {len(KB.get('metadata', {}).get('tokens_investigated', []))} tokens")
 
 
+async def batch_command(update, context):
+    """Batch scan multiple tokens. Usage: /batch base 0xABC 0xDEF 0xGHI"""
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /batch <chain> <contract1> <contract2> ...\n\n"
+            "Example:\n/batch base 0xABC...123 0xDEF...456 0xGHI...789\n\n"
+            "Scans all tokens, learns from each, pushes KB once at the end.")
+        return
+
+    chain_input = args[0]
+    chain = CHAINS.get(chain_input.lower(), chain_input.lower())
+    contracts = [a for a in args[1:] if a.startswith("0x") and len(a) == 42]
+
+    if not contracts:
+        await update.message.reply_text("No valid contract addresses found. Each must be 0x + 40 hex chars.")
+        return
+
+    msg = await update.message.reply_text(f"⏳ Batch scanning {len(contracts)} tokens on {chain}...")
+
+    results = []
+    icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low_with_smart_money": "🟢", "clean": "⚪"}
+
+    for i, contract in enumerate(contracts):
+        try:
+            await msg.edit_text(f"⏳ Scanning {i+1}/{len(contracts)}: {contract[:10]}...{contract[-6:]}")
+            result = scan_token(contract, chain)
+            sym = result.get("symbol", "?")
+            risk = result.get("risk_score", "?")
+            icon = icons.get(risk, "⚫")
+            hits = len(result.get("dev_signals", [])) + len(result.get("insider_signals", [])) + len(result.get("smart_signals", []))
+            whales = len(result.get("whale_alerts", []))
+            results.append(f"  {icon} {sym} — {risk.upper()}" + (f" · {hits} KB hits" if hits else "") + (f" · {whales} 🐋" if whales else ""))
+        except Exception as e:
+            results.append(f"  ⚫ {contract[:10]}... — ERROR: {str(e)[:40]}")
+
+    # Summary
+    total = sum(len(KB.get(s, {})) for s in ["deployers", "dev_adjacent", "insider_wallets", "smart_wallets"])
+    tracked = len(KB.get("holder_tracker", {}))
+    tokens_count = len(KB.get("metadata", {}).get("tokens_investigated", []))
+
+    lines = [f"📦 Batch Scan Complete: {len(contracts)} tokens on {chain}", ""]
+    lines += results
+    lines += ["", f"📋 KB: {total} tagged · {tracked} holders tracked · {tokens_count} tokens"]
+    lines.append("📝 KB updated and pushed to GitHub")
+
+    text = "\n".join(lines)
+    if len(text) > 4096: text = text[:4090] + "\n..."
+    await msg.edit_text(text)
+
+
+async def topscan_command(update, context):
+    """Auto-discover and scan top tokens on a chain. Usage: /topscan base 20"""
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: /topscan <chain> [count]\n\n"
+            "Auto-discovers the most traded tokens and scans them.\n"
+            "Default: top 20 tokens.\n\n"
+            "Example:\n/topscan base 30\n/topscan bsc 20")
+        return
+
+    chain_input = args[0]
+    chain = CHAINS.get(chain_input.lower(), chain_input.lower())
+    count = min(int(args[1]), 50) if len(args) > 1 and args[1].isdigit() else 20
+
+    msg = await update.message.reply_text(f"⏳ Discovering top {count} tokens on {chain}...")
+
+    # Exclude known non-memecoins
+    exclude = "'ETH','WETH','USDC','USDT','DAI','WBTC','cbBTC','USDbC','cbETH','rETH','wstETH','stETH','AERO','WELL','OVN','USD+','CBBTC','SAND','CBXRP','USDE','VVV','MORPHO','CBETH','WSTETH','SOL','EURC','CBMEGA','CBADA','ZEN','CBDOGE','USAD','SERV','CBLTC','WEETH','ZRO','AWETH','MSUSD','COMP','UNI','LINK','SNX','BAL','GRT','CRV','SUSHI','AAVE','MKR','LDO','RPL','OP','ARB','MATIC','BNB','TBTC','MSETH','USDS','UXRP','CBHYPE','CBZEC','eUSD','msUSD','sUSD','rsETH'"
+
+    try:
+        r = ds_query(f"""
+            SELECT asset_symbol, asset_id, COUNT(*) as txs
+            FROM {chain}.transfers_clustered
+            WHERE transaction_timestamp >= '2026-06-01'
+              AND asset_symbol NOT IN ({exclude})
+              AND asset_id NOT LIKE '%native%'
+              AND LENGTH(asset_symbol) <= 15
+            GROUP BY asset_symbol, asset_id
+            HAVING txs > 5000
+            ORDER BY txs DESC LIMIT {count}
+        """)
+    except Exception as e:
+        await msg.edit_text(f"Discovery failed: {str(e)[:100]}")
+        return
+
+    if not r.get("results"):
+        await msg.edit_text(f"No tokens found on {chain} matching criteria.")
+        return
+
+    tokens = r["results"]
+    await msg.edit_text(f"⏳ Found {len(tokens)} tokens on {chain}. Scanning...")
+
+    results = []
+    icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low_with_smart_money": "🟢", "clean": "⚪"}
+    already = set(KB.get("metadata", {}).get("tokens_investigated", []))
+
+    for i, token in enumerate(tokens):
+        sym = token["asset_symbol"]
+        aid = token["asset_id"]
+        ca = "0x" + aid.split(":")[-1] if ":" in aid else aid
+        new_flag = " 🆕" if sym not in already else ""
+
+        try:
+            if i % 5 == 0:
+                await msg.edit_text(f"⏳ Scanning {i+1}/{len(tokens)}: {sym}...")
+            result = scan_token(ca, chain)
+            risk = result.get("risk_score", "?")
+            icon = icons.get(risk, "⚫")
+            hits = len(result.get("dev_signals", [])) + len(result.get("insider_signals", [])) + len(result.get("smart_signals", []))
+            whales = len(result.get("whale_alerts", []))
+            line = f"  {icon} {sym} — {risk.upper()}"
+            if hits: line += f" · {hits} hits"
+            if whales: line += f" · {whales} 🐋"
+            line += new_flag
+            results.append(line)
+        except Exception as e:
+            results.append(f"  ⚫ {sym} — ERROR")
+
+    # Summary
+    total = sum(len(KB.get(s, {})) for s in ["deployers", "dev_adjacent", "insider_wallets", "smart_wallets"])
+    tracked = len(KB.get("holder_tracker", {}))
+    tokens_count = len(KB.get("metadata", {}).get("tokens_investigated", []))
+    new_smart = [v for v in KB.get("smart_wallets", {}).values() if "Auto" in v.get("notes", "")]
+
+    lines = [f"📦 Top Scan Complete: {len(tokens)} tokens on {chain}", ""]
+    lines += results
+    lines += ["", f"📋 KB: {total} tagged · {tracked} holders tracked · {tokens_count} tokens"]
+    if new_smart:
+        lines.append(f"🧠 {len(new_smart)} auto-discovered smart wallets")
+    lines.append("📝 KB updated and pushed to GitHub")
+
+    text = "\n".join(lines)
+    if len(text) > 4096: text = text[:4090] + "\n..."
+    await msg.edit_text(text)
+
+
 async def start_command(update, context):
     await update.message.reply_text(
-        "🔬 Memecoin Scanner v4\n\n"
-        "/scan <contract> <chain> — full scan\n"
+        "🔬 Memecoin Scanner v5\n\n"
+        "SCAN\n"
+        "/scan <contract> <chain> — single token\n"
+        "/batch <chain> <ca1> <ca2> ... — multiple tokens\n"
+        "/topscan <chain> [count] — auto-discover top tokens\n\n"
+        "INTEL\n"
         "/kb — knowledge base stats\n"
         "/history — last 20 scans\n"
         "/feed — smart money activity\n"
         "/reload — refresh KB\n\n"
-        "Features: DexScreener market data, GoPlus audit,\n"
-        "smart wallet detection, whale alerts, serial deployer\n"
-        "detection, insider flagging, concentration score.\n\n"
+        "Self-learning: deployers, serial factories,\n"
+        "smart wallets, insiders, whale alerts.\n"
+        "DexScreener + GoPlus audit on every scan.\n\n"
         "Chains: eth, base, bsc, arb, poly, op, avax")
 
 
 def main():
     global KB; KB = load_kb()
     total = sum(len(KB.get(s, {})) for s in ["deployers", "dev_adjacent", "insider_wallets", "smart_wallets"])
-    logger.info(f"KB: {total} wallets"); logger.info("Bot v4 started.")
+    logger.info(f"KB: {total} wallets"); logger.info("Bot v5 started.")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, fn in [("start", start_command), ("scan", scan_command), ("kb", kb_command),
-                    ("history", history_command), ("feed", feed_command), ("reload", reload_command)]:
+                    ("history", history_command), ("feed", feed_command), ("reload", reload_command),
+                    ("batch", batch_command), ("topscan", topscan_command)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.run_polling()
 
