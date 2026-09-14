@@ -158,14 +158,67 @@ def ds_query(sql):
 def get_kb_lookup():
     addrs = {}
     for addr, data in KB.get("deployers", {}).items():
-        addrs[addr] = {"tag": "DEV", "label": data.get("label", "?"), "risk": data.get("risk", "?")}
+        addrs[addr] = {"tag": "DEV", "label": data.get("label", "?"), "risk": data.get("risk", "?"), "confidence": data.get("confidence", 0)}
     for addr, data in KB.get("dev_adjacent", {}).items():
-        addrs[addr] = {"tag": data.get("tag", "DEV_ADJ"), "label": data.get("label", "?")}
+        addrs[addr] = {"tag": data.get("tag", "DEV_ADJ"), "label": data.get("label", "?"), "confidence": 0}
     for addr, data in KB.get("insider_wallets", {}).items():
-        addrs[addr] = {"tag": "INSIDER", "label": data.get("label", "?"), "profit": data.get("profit_usd", 0)}
+        addrs[addr] = {"tag": "INSIDER", "label": data.get("label", "?"), "profit": data.get("profit_usd", 0), "confidence": 0}
     for addr, data in KB.get("smart_wallets", {}).items():
-        addrs[addr] = {"tag": "SMART_MONEY", "label": data.get("label", "?"), "category": data.get("category", "?")}
+        addrs[addr] = {"tag": "SMART_MONEY", "label": data.get("label", "?"), "category": data.get("category", "?"), "confidence": data.get("confidence", 0)}
     return addrs
+
+
+def get_confidence(addr):
+    """Get confidence score (0-10) for a wallet."""
+    scores = KB.get("wallet_scores", {})
+    if addr in scores:
+        s = scores[addr]
+        total = s.get("wins", 0) + s.get("losses", 0)
+        if total >= 2:
+            return round(s["wins"] / total * 10, 1)
+    return 0
+
+
+def update_confidence_scores():
+    """Recalculate confidence scores for all tracked wallets based on token outcomes."""
+    tracker = KB.get("holder_tracker", {})
+    token_mcs = KB.get("token_mcs", {})
+    scores = KB.setdefault("wallet_scores", {})
+
+    for addr, data in tracker.items():
+        wins = 0
+        losses = 0
+        for token in data.get("tokens", []):
+            mc_data = token_mcs.get(token, {})
+            entry_mc = mc_data.get("entry_mc", {}).get(addr, 0)
+            current_mc = mc_data.get("current_mc", 0)
+            if entry_mc > 0 and current_mc > 0:
+                if current_mc >= entry_mc:
+                    wins += 1
+                else:
+                    losses += 1
+        total = wins + losses
+        if total >= 1:
+            scores[addr] = {"wins": wins, "losses": losses, "total": total, "win_rate": round(wins / total, 2)}
+
+    # Update confidence in smart_wallets
+    for addr, data in KB.get("smart_wallets", {}).items():
+        if addr in scores:
+            data["confidence"] = round(scores[addr]["wins"] / max(scores[addr]["total"], 1) * 10, 1)
+
+
+def record_token_mc(symbol, mc, holders):
+    """Record market cap for confidence tracking."""
+    if mc and mc > 0:
+        mcs = KB.setdefault("token_mcs", {})
+        if symbol not in mcs:
+            mcs[symbol] = {"current_mc": mc, "entry_mc": {}}
+        mcs[symbol]["current_mc"] = mc
+        # Record entry MC for wallets seeing this token for the first time
+        for h in holders:
+            addr = h.get("address", "")
+            if addr and addr not in mcs[symbol]["entry_mc"] and not h.get("is_pool"):
+                mcs[symbol]["entry_mc"][addr] = mc
 
 
 # ══════════════════════════════════════════════════════════════
@@ -225,8 +278,17 @@ def learn_from_scan(report, chain):
         elif tc >= 3 and addr in KB.get("smart_wallets", {}):
             KB["smart_wallets"][addr]["cross_token"] = tracker["tokens"]
         if addr in KB.get("smart_wallets", {}) and len(tracker["tokens"]) > 1 and tracker["tokens"][-1] == symbol:
-            whale_alerts.append(f"🐋 {KB['smart_wallets'][addr].get('label', addr[:16])} is in {symbol}")
+            conf = get_confidence(addr)
+            conf_str = f" ({conf}/10)" if conf > 0 else ""
+            whale_alerts.append(f"🐋 {KB['smart_wallets'][addr].get('label', addr[:16])}{conf_str} is in {symbol}")
     report["whale_alerts"] = whale_alerts
+
+    # Record market cap for confidence tracking
+    mkt = report.get("market") or {}
+    mc = mkt.get("mc", 0)
+    if mc:
+        record_token_mc(symbol, mc, report.get("holders", []))
+        update_confidence_scores()
 
     dist = report.get("distribution", {})
     if dist.get("free", 0) > 3 and dist.get("pool", 0) < 10:
@@ -353,9 +415,12 @@ def scan_token(contract, chain):
             if pct > 100: h["is_pool"] = True
             if row["address"] in kbl:
                 k = kbl[row["address"]]; h["kb_tag"] = k["tag"]; h["kb_label"] = k["label"]
+                conf = get_confidence(row["address"])
+                h["confidence"] = conf
+                conf_str = f" ({conf}/10)" if conf > 0 else ""
                 if "DEV" in k["tag"]: report["dev_signals"].append(f"{k['label']} holds {pct:.1f}%")
                 elif k["tag"] == "INSIDER": report["insider_signals"].append(f"{k['label']} holds {pct:.1f}%")
-                elif k["tag"] == "SMART_MONEY": report["smart_signals"].append(f"{k['label']} holds {pct:.1f}%")
+                elif k["tag"] == "SMART_MONEY": report["smart_signals"].append(f"{k['label']}{conf_str} holds {pct:.1f}%")
             report["holders"].append(h)
     except: pass
 
@@ -493,10 +558,12 @@ def format_report(r):
         lines += ["", "👑 TOP HOLDERS"]
         for h in holders[:5]:
             pct = h.get("pct", 0)
+            conf = h.get("confidence", 0)
+            conf_badge = f" ⭐{conf}/10" if conf >= 5 else (f" {conf}/10" if conf > 0 else "")
             if h.get("is_pool"): label = f"🔄 Pool/Router"
             elif h.get("kb_tag", "").startswith("DEV"): label = f"🚨 {h.get('kb_label', 'DEV')}"
             elif h.get("kb_tag") == "INSIDER": label = f"🚩 {h.get('kb_label', 'INSIDER')}"
-            elif h.get("kb_tag") == "SMART_MONEY": label = f"🧠 {h.get('kb_label', 'SMART')}"
+            elif h.get("kb_tag") == "SMART_MONEY": label = f"🧠 {h.get('kb_label', 'SMART')}{conf_badge}"
             elif h.get("name"): label = h["name"] + (f" [{h['category']}]" if h.get("category") else "")
             else: label = h.get("addr_short", "")
             lines.append(f"  {pct}% — {label}")
@@ -727,6 +794,52 @@ async def topscan_command(update, context):
     await msg.edit_text(text)
 
 
+async def scores_command(update, context):
+    """Show wallet confidence scores."""
+    scores = KB.get("wallet_scores", {})
+    sw = KB.get("smart_wallets", {})
+    tracker = KB.get("holder_tracker", {})
+
+    if not scores:
+        await update.message.reply_text("No confidence scores yet. Need more scans for the bot to calculate win rates.")
+        return
+
+    # Merge scores with labels
+    scored = []
+    for addr, s in scores.items():
+        total = s.get("total", 0)
+        if total < 2: continue
+        win_rate = s.get("win_rate", 0)
+        conf = round(win_rate * 10, 1)
+        label = ""
+        if addr in sw:
+            label = sw[addr].get("label", addr[:16])
+        elif addr in tracker:
+            name = tracker[addr].get("name", "")
+            label = name if name else addr[:16] + "..."
+        else:
+            label = addr[:16] + "..."
+        scored.append((conf, label, s["wins"], s["losses"], total))
+
+    scored.sort(reverse=True)
+
+    lines = ["⭐ Wallet Confidence Scores", "", "  Score | W/L  | Wallet"]
+    lines.append("  " + "-" * 50)
+
+    for conf, label, wins, losses, total in scored[:20]:
+        bar = "🟩" * int(conf) + "⬜" * (10 - int(conf))
+        lines.append(f"  {conf:>4}/10 | {wins}W/{losses}L | {label}")
+
+    if not scored:
+        lines.append("  Need 2+ tokens per wallet to score.")
+
+    total_scored = len(scored)
+    high_conf = sum(1 for c, *_ in scored if c >= 7)
+    lines += ["", f"  {total_scored} wallets scored · {high_conf} high confidence (7+)"]
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def start_command(update, context):
     await update.message.reply_text(
         "🔬 Memecoin Scanner v5\n\n"
@@ -736,11 +849,13 @@ async def start_command(update, context):
         "/topscan <chain> [count] — auto-discover top tokens\n\n"
         "INTEL\n"
         "/kb — knowledge base stats\n"
+        "/scores — wallet confidence rankings\n"
         "/history — last 20 scans\n"
         "/feed — smart money activity\n"
         "/reload — refresh KB\n\n"
         "Self-learning: deployers, serial factories,\n"
-        "smart wallets, insiders, whale alerts.\n"
+        "smart wallets, insiders, whale alerts,\n"
+        "confidence scoring (win rate tracking).\n"
         "DexScreener + GoPlus audit on every scan.\n\n"
         "Chains: eth, base, bsc, arb, poly, op, avax")
 
@@ -752,7 +867,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, fn in [("start", start_command), ("scan", scan_command), ("kb", kb_command),
                     ("history", history_command), ("feed", feed_command), ("reload", reload_command),
-                    ("batch", batch_command), ("topscan", topscan_command)]:
+                    ("batch", batch_command), ("topscan", topscan_command), ("scores", scores_command)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.run_polling()
 
