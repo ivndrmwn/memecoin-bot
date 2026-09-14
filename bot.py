@@ -815,32 +815,61 @@ async def topscan_command(update, context):
     chain = CHAINS.get(chain_input.lower(), chain_input.lower())
     count = min(int(args[1]), 50) if len(args) > 1 and args[1].isdigit() else 20
 
-    msg = await update.message.reply_text(f"⏳ Discovering top {count} tokens on {chain}...")
+    msg = await update.message.reply_text(f"⏳ Discovering top {count} memecoins on {chain}...")
 
-    # Exclude known non-memecoins
-    exclude = "'ETH','WETH','USDC','USDT','DAI','WBTC','cbBTC','USDbC','cbETH','rETH','wstETH','stETH','AERO','WELL','OVN','USD+','CBBTC','SAND','CBXRP','USDE','VVV','MORPHO','CBETH','WSTETH','SOL','EURC','CBMEGA','CBADA','ZEN','CBDOGE','USAD','SERV','CBLTC','WEETH','ZRO','AWETH','MSUSD','COMP','UNI','LINK','SNX','BAL','GRT','CRV','SUSHI','AAVE','MKR','LDO','RPL','OP','ARB','MATIC','BNB','TBTC','MSETH','USDS','UXRP','CBHYPE','CBZEC','eUSD','msUSD','sUSD','rsETH'"
+    # Exclude known non-memecoins across all chains
+    exclude = (
+        "'ETH','WETH','USDC','USDT','DAI','WBTC','WBNB','BUSD','BNB','SOL','MATIC','ARB','OP',"
+        "'cbBTC','USDbC','cbETH','rETH','wstETH','stETH','AERO','WELL','OVN','USD+',"
+        "'CBBTC','SAND','CBXRP','USDE','VVV','MORPHO','CBETH','WSTETH','EURC',"
+        "'CBMEGA','CBADA','ZEN','CBDOGE','USAD','SERV','CBLTC','WEETH','ZRO',"
+        "'AWETH','MSUSD','COMP','UNI','LINK','SNX','BAL','GRT','CRV','SUSHI',"
+        "'AAVE','MKR','LDO','RPL','TBTC','MSETH','USDS','UXRP','CBHYPE','CBZEC',"
+        "'eUSD','msUSD','sUSD','rsETH','WUSD','BRZ','BTCB','BETH','CAKE','XVS',"
+        "'BAKE','ALPACA','BSW','TUSD','FDUSD','SFM','SAFEMOON','XRP','ADA',"
+        "'DOT','AVAX','ATOM','FIL','ICP','NEAR','APT','SUI','SEI','TIA',"
+        "'PYTH','JUP','RAY','ORCA','MSOL','JSOL','BONK','WIF','JTO','W',"
+        "'RENDER','FET','AGIX','OCEAN','TAO','KAS','INJ','TRX','TON','XLM'"
+    )
 
+    # Fetch with volume filter to get real tokens only
     try:
         r = ds_query(f"""
-            SELECT asset_symbol, asset_id, COUNT(*) as txs
+            SELECT asset_symbol, asset_id, COUNT(*) as txs, SUM(amount_usd) as vol
             FROM {chain}.transfers_clustered
             WHERE transaction_timestamp >= '2026-06-01'
               AND asset_symbol NOT IN ({exclude})
               AND asset_id NOT LIKE '%native%'
-              AND LENGTH(asset_symbol) <= 15
+              AND LENGTH(asset_symbol) BETWEEN 2 AND 12
             GROUP BY asset_symbol, asset_id
-            HAVING txs > 5000
-            ORDER BY txs DESC LIMIT {count}
+            HAVING txs > 5000 AND vol > 100000
+            ORDER BY vol DESC LIMIT {count * 3}
         """)
     except Exception as e:
         await msg.edit_text(f"Discovery failed: {str(e)[:100]}")
         return
 
     if not r.get("results"):
-        await msg.edit_text(f"No tokens found on {chain} matching criteria.")
+        await msg.edit_text(f"No memecoins found on {chain}.")
         return
 
-    tokens = r["results"]
+    # Filter: only ASCII names, no empty, no known DeFi patterns
+    filtered = []
+    for row in r["results"]:
+        sym = row["asset_symbol"]
+        if not sym or not sym.strip(): continue
+        if not sym.isascii(): continue
+        if len(sym.strip()) < 2: continue
+        if any(x in sym.upper() for x in ["AERO","UNI-V","CLOB","POS","WETH","USD","LP","POOL","SWAP","WRAPPED"]): continue
+        if sym.startswith("cb") or sym.startswith("CB") or sym.startswith("SY-"): continue
+        filtered.append(row)
+        if len(filtered) >= count: break
+
+    if not filtered:
+        await msg.edit_text(f"No memecoins found on {chain} after filtering.")
+        return
+
+    tokens = filtered
     await msg.edit_text(f"⏳ Found {len(tokens)} tokens on {chain}. Scanning...")
 
     results = []
