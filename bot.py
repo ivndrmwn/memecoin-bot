@@ -273,6 +273,28 @@ def learn_from_scan(report, chain):
                         KB["deployers"][d["address"]].update({"risk": "medium", "pattern": "serial_factory", "label": f"Serial deployer ({len(existing)} tokens)"})
         except: pass
 
+    # Learn bundle wallets (tag as dev-adjacent)
+    KB.setdefault("bundle_tracker", {})
+    for b in report.get("bundle", []):
+        addr = b["address"]
+        if addr not in KB.get("deployers", {}) and b.get("bought_pct", 0) >= 1:
+            bt = KB["bundle_tracker"].setdefault(addr, {"tokens": [], "total_pct": 0})
+            if symbol not in bt["tokens"]:
+                bt["tokens"].append(symbol)
+                bt["total_pct"] += b["bought_pct"]
+                changed = True
+            # If bundled in 2+ tokens, flag as suspicious
+            if len(bt["tokens"]) >= 2 and addr not in KB.get("dev_adjacent", {}):
+                KB.setdefault("dev_adjacent", {})
+                KB["dev_adjacent"][addr] = {
+                    "tag": "DEV_BUNDLER",
+                    "label": f"Serial bundler ({len(bt['tokens'])} tokens, {bt['total_pct']:.0f}% avg)",
+                    "tokens_bundled": bt["tokens"],
+                    "notes": "Auto-discovered: bundled at launch in multiple tokens.",
+                }
+                changed = True
+                logger.info(f"KB+: serial bundler {addr[:16]}... ({len(bt['tokens'])} tokens)")
+
     KB.setdefault("holder_tracker", {})
     whale_alerts = []
     for h in report.get("holders", []):
@@ -416,6 +438,43 @@ def scan_token(contract, chain):
             if free > 3 and pool < 10: report["distribution_signals"].append(f"{free} wallets received free tokens, only {pool:.0f}% to DEX")
         except: pass
 
+    # Bundle detection: find wallets that bought in the first minute of launch
+    bundle = []
+    try:
+        first_tx = report.get("stats", {}).get("first", "")
+        if first_tx and asset_id:
+            r = ds_query(f"""SELECT receiver_address, SUM(amount_asset) as bought, COUNT(*) as txs,
+                MIN(transaction_timestamp) as first_buy
+                FROM {chain}.transfers_clustered
+                WHERE asset_id = '{asset_id}'
+                  AND transaction_timestamp >= '{first_tx}'
+                  AND transaction_timestamp < '{first_tx[:10]}T{first_tx[11:13]}:{str(int(first_tx[14:16])+5).zfill(2)}:00'
+                  AND sender_address != '0x0000000000000000000000000000000000000000'
+                  AND receiver_address != '0x0000000000000000000000000000000000000000'
+                GROUP BY receiver_address
+                ORDER BY first_buy ASC
+                LIMIT 20""")
+            deployer_addrs = set(d["address"] for d in deployers)
+            supply = total_supply or 1
+            for row in r.get("results", []):
+                addr = row["receiver_address"]
+                if addr in deployer_addrs: continue
+                bought = row["bought"] or 0
+                pct = bought / supply * 100
+                if pct < 0.1: continue
+                b = {"address": addr, "addr_short": addr[:12] + "..." + addr[-4:],
+                     "bought_pct": round(pct, 1), "txs": row["txs"],
+                     "first_buy": str(row["first_buy"])[:19]}
+                if addr in kbl:
+                    k = kbl[addr]
+                    b["kb_tag"] = k["tag"]; b["kb_label"] = k["label"]
+                bundle.append(b)
+            report["bundle"] = bundle
+            if len(bundle) >= 3:
+                total_bundle_pct = sum(b["bought_pct"] for b in bundle)
+                report["distribution_signals"].append(f"{len(bundle)} wallets bundled at launch ({total_bundle_pct:.0f}% of supply)")
+    except: pass
+
     # Top holders
     try:
         r = ds_query(f"""SELECT address, balance, name, category FROM (
@@ -549,6 +608,22 @@ def format_report(r):
     if dd:
         lines += ["", "💰 DISTRIBUTION"]
         lines += [f"  {d}" for d in dd[:6]]
+
+    # Bundle
+    bundle = r.get("bundle", [])
+    if bundle:
+        lines += ["", "🎯 LAUNCH BUNDLE (first buyers)"]
+        for b in bundle[:5]:
+            pct = b.get("bought_pct", 0)
+            addr = b.get("addr_short", "")
+            if b.get("kb_tag", "").startswith("DEV"): label = f"🚨 {b.get('kb_label', 'DEV')}"
+            elif b.get("kb_tag") == "INSIDER": label = f"🚩 {b.get('kb_label', '')}"
+            elif b.get("kb_tag") == "SMART_MONEY":
+                conf = get_confidence(b["address"])
+                conf_str = f" ({conf}/10)" if conf > 0 else ""
+                label = f"🧠 {b.get('kb_label', '')}{conf_str}"
+            else: label = addr
+            lines.append(f"  {pct}% — {label} · {b.get('first_buy', '')[-8:]}")
 
     # Warnings
     if dist_s:
