@@ -933,34 +933,237 @@ async def scores_command(update, context):
     await update.message.reply_text("\n".join(lines))
 
 
+async def monitor_command(update, context):
+    """Start/stop monitoring smart wallets for new buys."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/monitor on <chain> [minutes] — start monitoring\n"
+            "/monitor off — stop monitoring\n"
+            "/monitor status — check if running\n\n"
+            "Example: /monitor on base 10\n"
+            "Checks top smart wallets every 10 minutes.\n"
+            "Alerts when they buy new tokens.")
+        return
+
+    action = args[0].lower()
+
+    if action == "off":
+        jobs = context.job_queue.get_jobs_by_name("monitor")
+        for job in jobs: job.schedule_removal()
+        await update.message.reply_text("🔴 Monitor stopped.")
+        return
+
+    if action == "status":
+        jobs = context.job_queue.get_jobs_by_name("monitor")
+        if jobs:
+            await update.message.reply_text(f"🟢 Monitor running. {len(jobs)} job(s) active.")
+        else:
+            await update.message.reply_text("🔴 Monitor not running. Use /monitor on base")
+        return
+
+    if action == "on":
+        chain_input = args[1] if len(args) > 1 else "base"
+        chain = CHAINS.get(chain_input.lower(), chain_input.lower())
+        interval = int(args[2]) if len(args) > 2 and args[2].isdigit() else 10
+        interval = max(5, min(interval, 60))
+
+        # Remove existing jobs
+        jobs = context.job_queue.get_jobs_by_name("monitor")
+        for job in jobs: job.schedule_removal()
+
+        # Store chat_id and chain for the job
+        context.job_queue.run_repeating(
+            monitor_job,
+            interval=interval * 60,
+            first=10,
+            data={"chat_id": update.effective_chat.id, "chain": chain},
+            name="monitor",
+        )
+        sw_count = len(KB.get("smart_wallets", {}))
+        await update.message.reply_text(
+            f"🟢 Monitor started\n"
+            f"  Chain: {chain}\n"
+            f"  Interval: every {interval} min\n"
+            f"  Tracking: {sw_count} smart wallets\n\n"
+            f"You will get alerts when tracked wallets buy new tokens.")
+
+
+async def monitor_job(context):
+    """Background job: check smart wallets for new token buys."""
+    data = context.job.data
+    chat_id = data["chat_id"]
+    chain = data["chain"]
+
+    sw = KB.get("smart_wallets", {})
+    if not sw: return
+
+    # Get top 10 smart wallets by confidence
+    scored = []
+    for addr, wdata in sw.items():
+        conf = get_confidence(addr)
+        if conf >= 3 or len(wdata.get("cross_token", [])) >= 3:
+            scored.append((addr, wdata, conf))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    top_wallets = scored[:10]
+
+    if not top_wallets: return
+
+    alerts = []
+    known_tokens = set(KB.get("metadata", {}).get("tokens_investigated", []))
+
+    for addr, wdata, conf in top_wallets:
+        try:
+            r = ds_query(f"""
+                SELECT DISTINCT asset_symbol, asset_id
+                FROM {chain}.transfers_clustered
+                WHERE receiver_address = '{addr}'
+                  AND transaction_timestamp >= '{time.strftime("%Y-%m-%d", time.gmtime(time.time() - 3600))}'
+                  AND asset_id NOT LIKE '%native%'
+                  AND amount_asset > 0
+                LIMIT 5
+            """)
+            for row in r.get("results", []):
+                sym = row["asset_symbol"]
+                if sym and sym not in known_tokens and sym.isascii() and len(sym) <= 12:
+                    conf_str = f" ({conf}/10)" if conf > 0 else ""
+                    label = wdata.get("label", addr[:16])
+                    ca = "0x" + row["asset_id"].split(":")[-1]
+                    alerts.append(f"🚨 {label}{conf_str} bought {sym}\n   CA: {ca}")
+        except:
+            pass
+
+    if alerts:
+        msg = "🔔 SMART WALLET ALERT\n\n" + "\n\n".join(alerts[:5])
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+
+
+async def exits_command(update, context):
+    """Check if deployers/bundlers of a token are selling (exit signals)."""
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /exits <contract> <chain>\n\nChecks if deployer and early bundler wallets are selling.")
+        return
+
+    contract = args[0].lower()
+    chain_input = args[1] if len(args) > 1 else "base"
+    chain = CHAINS.get(chain_input.lower(), chain_input.lower())
+    ca_frag = contract[2:] if contract.startswith("0x") else contract
+
+    msg = await update.message.reply_text(f"⏳ Checking exit signals...")
+
+    try:
+        # Find the token
+        r = ds_query(f"SELECT DISTINCT asset_symbol, asset_id FROM {chain}.transfers_clustered WHERE LOWER(asset_id) LIKE '%{ca_frag}%' LIMIT 1")
+        if not r.get("results"):
+            await msg.edit_text("Token not found.")
+            return
+        asset_id = r["results"][0]["asset_id"]
+        symbol = r["results"][0]["asset_symbol"]
+
+        # Find deployer
+        r2 = ds_query(f"SELECT receiver_address, SUM(amount_asset) as minted FROM {chain}.transfers_clustered WHERE asset_id = '{asset_id}' AND sender_address = '0x0000000000000000000000000000000000000000' GROUP BY receiver_address ORDER BY minted DESC LIMIT 1")
+        if not r2.get("results"):
+            await msg.edit_text("No deployer found.")
+            return
+        deployer = r2["results"][0]["receiver_address"]
+        total_supply = r2["results"][0]["minted"] or 1
+
+        # Check deployer sells (recent 7 days)
+        r3 = ds_query(f"""
+            SELECT sender_address, SUM(amount_asset) as sold, COUNT(*) as txs,
+                   MAX(transaction_timestamp) as last_sell
+            FROM {chain}.transfers_clustered
+            WHERE asset_id = '{asset_id}'
+              AND transaction_timestamp >= '{time.strftime("%Y-%m-%d", time.gmtime(time.time() - 604800))}'
+              AND sender_address != '0x0000000000000000000000000000000000000000'
+            GROUP BY sender_address
+            ORDER BY sold DESC
+            LIMIT 15
+        """)
+
+        lines = [f"📤 Exit Signals: {symbol}", ""]
+
+        # Check if deployer sold
+        deployer_sold = False
+        for row in r3.get("results", []):
+            if row["sender_address"] == deployer:
+                sold_pct = (row["sold"] or 0) / total_supply * 100
+                lines.append(f"🚨 DEPLOYER SOLD {sold_pct:.1f}% in last 7 days")
+                lines.append(f"   Last sell: {str(row['last_sell'])[:19]}")
+                deployer_sold = True
+                break
+
+        if not deployer_sold:
+            lines.append("✅ Deployer has NOT sold in last 7 days")
+
+        # Top sellers
+        lines += ["", "📤 TOP SELLERS (7 days)"]
+        kbl = get_kb_lookup()
+        for row in r3.get("results", [])[:8]:
+            addr = row["sender_address"]
+            sold = row["sold"] or 0
+            pct = sold / total_supply * 100
+            addr_short = addr[:12] + "..." + addr[-4:]
+
+            label = addr_short
+            if addr in kbl:
+                k = kbl[addr]
+                if "DEV" in k["tag"]: label = f"🚨 {k['label']}"
+                elif k["tag"] == "INSIDER": label = f"🚩 {k['label']}"
+                elif k["tag"] == "SMART_MONEY": label = f"🧠 {k['label']}"
+            elif addr == deployer:
+                label = f"🚨 DEPLOYER"
+
+            # Check if this is a bundler
+            bt = KB.get("bundle_tracker", {}).get(addr)
+            if bt: label = f"🎯 Bundler ({len(bt.get('tokens', []))} tokens)"
+
+            lines.append(f"  {pct:.1f}% — {label} · {row['txs']} sells · last: {str(row['last_sell'])[-8:]}")
+
+        lines += ["", f"Supply: {total_supply:,.0f} {symbol}"]
+
+        text = "\n".join(lines)
+        if len(text) > 4096: text = text[:4090] + "\n..."
+        await msg.edit_text(text)
+
+    except Exception as e:
+        await msg.edit_text(f"Error: {str(e)[:200]}")
+
+
 async def start_command(update, context):
     await update.message.reply_text(
-        "🔬 Memecoin Scanner v5\n\n"
+        "🔬 Memecoin Scanner v6\n\n"
         "SCAN\n"
-        "/scan <contract> <chain> — single token\n"
-        "/batch <chain> <ca1> <ca2> ... — multiple tokens\n"
-        "/topscan <chain> [count] — auto-discover top tokens\n\n"
+        "/scan <contract> <chain> — full scan\n"
+        "/batch <chain> <ca1> <ca2> ... — batch scan\n"
+        "/topscan <chain> [count] — auto-discover\n\n"
+        "SIGNALS\n"
+        "/exits <contract> <chain> — who is selling?\n"
+        "/monitor on <chain> [min] — smart wallet alerts\n"
+        "/monitor off — stop alerts\n\n"
         "INTEL\n"
-        "/kb — knowledge base stats\n"
-        "/scores — wallet confidence rankings\n"
-        "/history — last 20 scans\n"
+        "/kb — knowledge base\n"
+        "/scores — confidence rankings\n"
+        "/history — scan history\n"
         "/feed — smart money activity\n"
         "/reload — refresh KB\n\n"
-        "Self-learning: deployers, serial factories,\n"
-        "smart wallets, insiders, whale alerts,\n"
-        "confidence scoring (win rate tracking).\n"
-        "DexScreener + GoPlus audit on every scan.\n\n"
+        "Auto-learns: deployers, bundlers, smart wallets,\n"
+        "insiders, confidence scores, exit signals.\n"
+        "DexScreener + GoPlus on every scan.\n\n"
         "Chains: eth, base, bsc, arb, poly, op, avax")
 
 
 def main():
     global KB; KB = load_kb()
     total = sum(len(KB.get(s, {})) for s in ["deployers", "dev_adjacent", "insider_wallets", "smart_wallets"])
-    logger.info(f"KB: {total} wallets"); logger.info("Bot v5 started.")
+    logger.info(f"KB: {total} wallets"); logger.info("Bot v6 started.")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, fn in [("start", start_command), ("scan", scan_command), ("kb", kb_command),
                     ("history", history_command), ("feed", feed_command), ("reload", reload_command),
-                    ("batch", batch_command), ("topscan", topscan_command), ("scores", scores_command)]:
+                    ("batch", batch_command), ("topscan", topscan_command), ("scores", scores_command),
+                    ("monitor", monitor_command), ("exits", exits_command)]:
         app.add_handler(CommandHandler(cmd, fn))
     app.run_polling()
 
