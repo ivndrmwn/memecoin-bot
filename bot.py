@@ -135,17 +135,35 @@ def load_kb():
 
 
 def save_kb():
-    if not GITHUB_TOKEN: return False
+    if not GITHUB_TOKEN:
+        logger.warning("GitHub push skipped: GITHUB_TOKEN is empty")
+        return False
     try:
+        logger.info(f"GitHub push starting. Repo: {GITHUB_REPO}")
         headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
         kb_json = json.dumps(KB, separators=(",", ":"), ensure_ascii=True)
         content_b64 = base64.b64encode(kb_json.encode()).decode()
+        logger.info(f"GitHub push: KB size {len(kb_json)} bytes")
         r = req.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/kb_data.txt", headers=headers, timeout=10)
+        logger.info(f"GitHub GET status: {r.status_code}")
         payload = {"message": "KB auto-update", "content": content_b64}
-        if r.status_code == 200: payload["sha"] = r.json().get("sha")
+        if r.status_code == 200:
+            payload["sha"] = r.json().get("sha")
+        elif r.status_code == 404:
+            logger.info("GitHub: file does not exist yet, creating")
+        else:
+            logger.warning(f"GitHub GET failed: {r.status_code} {r.text[:200]}")
         r2 = req.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/kb_data.txt", json=payload, headers=headers, timeout=15)
-        return r2.status_code in (200, 201)
-    except: return False
+        logger.info(f"GitHub PUT status: {r2.status_code}")
+        if r2.status_code in (200, 201):
+            logger.info("GitHub push SUCCESS")
+            return True
+        else:
+            logger.warning(f"GitHub push FAILED: {r2.status_code} {r2.text[:200]}")
+            return False
+    except Exception as e:
+        logger.error(f"GitHub push ERROR: {e}")
+        return False
 
 
 def ds_query(sql):
